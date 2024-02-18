@@ -58,8 +58,89 @@ impl<R> SrcBuffer<R> {
     }
 }
 
+impl<R> SrcBuffer<R> {}
+
+impl<R: io::Read> SrcBuffer<R> {
+    fn fetch(&mut self) -> Result<()> {
+        let mut buf = if self.cache.len() == self.block_offset + 1 {
+            let mut key = 0usize;
+            for (k, _v) in &self.cache {
+                key = *k;
+                break;
+            }
+            self.cache.remove(&key).unwrap().buf
+        } else {
+            let v = vec![0u8; self.block_len];
+            v.into_boxed_slice()
+        };
+
+        let mut read_len = 0;
+
+        while read_len != buf.len() {
+            let len = self.read.read(&mut buf[read_len..])?;
+            if len == 0 {
+                self.eof_known = true;
+                break;
+            } else {
+                read_len += len;
+            }
+        }
+
+        let entry = CacheEntry { len: read_len, buf };
+        self.cache.insert(self.block_offset, entry);
+        self.block_offset += 1;
+        Ok(())
+    }
+
+    fn getblk(&mut self) -> io::Result<()> {
+        trace!(
+            "getsrcblk: curblkno={}, getblkno={}",
+            self.src.curblkno,
+            self.src.getblkno,
+        );
+
+        let blkno = self.src.getblkno as usize;
+
+        let entry = loop {
+            match self.cache.get_mut(&blkno) {
+                Some(entry) => break entry,
+                None => {
+                    if blkno < self.block_offset {
+                        eprintln!("invalid blkno={}, offset={}", blkno, self.block_offset);
+                        for (k, _v) in &self.cache {
+                            eprintln!("key={:?}", k);
+                        }
+                        panic!("invalid blkno");
+                    }
+
+                    self.fetch()?;
+                    continue;
+                }
+            }
+        };
+
+        let src = &mut self.src;
+        let buf_len = entry.len;
+        let data = &entry.buf[..buf_len];
+
+        src.curblkno = src.getblkno;
+        src.curblk = data.as_ptr();
+        src.onblk = buf_len as u32;
+
+        src.eof_known = self.eof_known as i32;
+        if !self.eof_known {
+            src.max_blkno = src.curblkno;
+            src.onlastblk = src.onblk;
+        } else {
+            src.max_blkno = (self.block_offset - 1) as u64;
+            src.onlastblk = (self.read_len % src.blksize as usize) as u32;
+        }
+        Ok(())
+    }
+}
+
 impl<R: AsyncRead + Unpin> SrcBuffer<R> {
-    async fn fetch(&mut self) -> Result<()> {
+    async fn fetch_async(&mut self) -> Result<()> {
         let mut buf = if self.cache.len() == self.block_offset + 1 {
             let mut key = 0usize;
             for (k, _v) in &self.cache {
@@ -90,7 +171,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
         Ok(())
     }
 
-    async fn getblk(&mut self) -> io::Result<()> {
+    async fn getblk_async(&mut self) -> io::Result<()> {
         trace!(
             "getsrcblk: curblkno={}, getblkno={}",
             self.src.curblkno,
@@ -111,7 +192,7 @@ impl<R: AsyncRead + Unpin> SrcBuffer<R> {
                         panic!("invalid blkno");
                     }
 
-                    self.fetch().await?;
+                    self.fetch_async().await?;
                     continue;
                 }
             }
@@ -249,10 +330,55 @@ where
     process_async(cfg, ProcessMode::Encode, input, src, out).await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum ProcessMode {
     Encode,
     Decode,
+}
+
+pub fn process<R1, R2, W>(
+    cfg: Xd3Config,
+    mode: ProcessMode,
+    mut input: R1,
+    src: R2,
+    mut output: W,
+) -> io::Result<()>
+where
+    R1: io::Read,
+    R2: io::Read,
+    W: io::Write,
+{
+    let mut state = ProcessState::new(cfg, src)?;
+
+    use binding::xd3_rvalues::*;
+
+    loop {
+        let res = state.step(mode);
+        debug!("step: mode={:?}, res={:?}", mode, res);
+        match res {
+            XD3_INPUT => {
+                if state.eof {
+                    break;
+                }
+                state.read_input(&mut input)?;
+            }
+            XD3_OUTPUT => {
+                state.write_output(&mut output)?;
+            }
+            XD3_GETSRCBLK => {
+                state.src_buf.getblk()?;
+            }
+            XD3_GOTHEADER | XD3_WINSTART | XD3_WINFINISH => {
+                // do nothing
+            }
+            XD3_TOOFARBACK | XD3_INTERNAL | XD3_INVALID | XD3_INVALID_INPUT | XD3_NOSECOND
+            | XD3_UNIMPLEMENTED => {
+                return Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", res)));
+            }
+        }
+    }
+
+    output.flush()
 }
 
 pub async fn process_async<R1, R2, W>(
@@ -278,13 +404,13 @@ where
                 if state.eof {
                     break;
                 }
-                state.read_input(&mut input).await?;
+                state.read_input_async(&mut input).await?;
             }
             XD3_OUTPUT => {
-                state.write_output(&mut output).await?;
+                state.write_output_async(&mut output).await?;
             }
             XD3_GETSRCBLK => {
-                state.src_buf.getblk().await?;
+                state.src_buf.getblk_async().await?;
             }
             XD3_GOTHEADER | XD3_WINSTART | XD3_WINFINISH => {
                 // do nothing
@@ -309,10 +435,7 @@ struct ProcessState<R> {
     eof: bool,
 }
 
-impl<R> ProcessState<R>
-where
-    R: AsyncRead + Unpin,
-{
+impl<R> ProcessState<R> {
     fn new(mut cfg: Xd3Config, src: R) -> io::Result<Self> {
         // log::info!("ProcessState::new config={:?}", cfg);
 
@@ -354,6 +477,51 @@ where
         })
     }
 
+    fn read_input<R2>(&mut self, mut input: R2) -> io::Result<()>
+    where
+        R2: io::Read,
+    {
+        let input_buf = &mut self.input_buf;
+
+        let read_size = match input.read(input_buf) {
+            Ok(n) => n,
+            Err(_e) => {
+                debug!("error on read: {:?}", _e);
+                return Err(io::Error::new(io::ErrorKind::Other, "xd3: read_input"));
+            }
+        };
+        debug!("read_size={}", read_size);
+
+        {
+            let stream = self.stream.inner.as_mut();
+            if read_size == 0 {
+                // xd3_set_flags
+                stream.flags |= binding::xd3_flags::XD3_FLUSH as i32;
+                self.eof = true;
+            }
+            // xd3_avail_input
+            stream.next_in = input_buf.as_ptr();
+            stream.avail_in = read_size as u32;
+        }
+
+        Ok(())
+    }
+
+    fn write_output<W>(&mut self, mut output: W) -> io::Result<()>
+    where
+        W: io::Write,
+    {
+        let out_data = {
+            let stream = self.stream.inner.as_mut();
+            unsafe { std::slice::from_raw_parts(stream.next_out, stream.avail_out as usize) }
+        };
+        output.write_all(out_data)?;
+
+        // xd3_consume_output
+        self.stream.inner.as_mut().avail_out = 0;
+        Ok(())
+    }
+
     fn step(&mut self, mode: ProcessMode) -> binding::xd3_rvalues {
         unsafe {
             let stream = self.stream.inner.as_mut();
@@ -363,8 +531,13 @@ where
             })
         }
     }
+}
 
-    async fn read_input<R2>(&mut self, mut input: R2) -> io::Result<()>
+impl<R> ProcessState<R>
+where
+    R: AsyncRead + Unpin,
+{
+    async fn read_input_async<R2>(&mut self, mut input: R2) -> io::Result<()>
     where
         R2: Unpin + AsyncRead,
     {
@@ -393,7 +566,7 @@ where
         Ok(())
     }
 
-    async fn write_output<W>(&mut self, mut output: W) -> io::Result<()>
+    async fn write_output_async<W>(&mut self, mut output: W) -> io::Result<()>
     where
         W: Unpin + AsyncWrite,
     {
